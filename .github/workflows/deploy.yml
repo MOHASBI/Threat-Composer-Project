@@ -1,0 +1,115 @@
+name: Deploy to ECS
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Optional tag to deploy (e.g. abc1234). Leave empty to deploy the image most recently pushed to ECR.'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: eu-west-2
+      ECS_TASK_FAMILY: threat-composer-task
+      ECS_CLUSTER: threat-composer-cluster
+      ECS_SERVICE: threat-composer-service
+      ECR_REPOSITORY: threat-composer-app
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Resolve image URI
+        id: image
+        env:
+          OVERRIDE_TAG: ${{ inputs.image_tag }}
+        run: |
+          set -euo pipefail
+          REPO="${{ env.ECR_REPOSITORY }}"
+          REPO_URI=$(aws ecr describe-repositories \
+            --repository-names "$REPO" \
+            --query 'repositories[0].repositoryUri' \
+            --output text)
+          if [ -z "$REPO_URI" ] || [ "$REPO_URI" = "None" ]; then
+            echo "ECR repository $REPO not found"
+            exit 1
+          fi
+
+          if [ -n "${OVERRIDE_TAG:-}" ]; then
+            IMAGE_URI="${REPO_URI}:${OVERRIDE_TAG}"
+            echo "Using explicit tag from workflow input: $IMAGE_URI"
+            echo "uri=$IMAGE_URI" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          DETAIL=$(aws ecr describe-images \
+            --repository-name "$REPO" \
+            --query 'sort_by(imageDetails,& imagePushedAt)[-1]' \
+            --output json)
+
+          if [ "$DETAIL" = "null" ] || [ -z "$DETAIL" ]; then
+            echo "No images in ECR repository $REPO"
+            exit 1
+          fi
+
+          DIGEST=$(echo "$DETAIL" | jq -r '.imageDigest')
+          if [ -z "$DIGEST" ] || [ "$DIGEST" = "null" ]; then
+            echo "Could not read image digest from ECR"
+            exit 1
+          fi
+
+          IMAGE_URI="${REPO_URI}@${DIGEST}"
+          echo "Latest image by push time: $IMAGE_URI"
+          echo "Tags on that image: $(echo "$DETAIL" | jq -r '(.imageTags // []) | join(", ")')"
+          echo "uri=$IMAGE_URI" >> "$GITHUB_OUTPUT"
+
+      - name: Get current task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition "${{ env.ECS_TASK_FAMILY }}" \
+            --query taskDefinition > task-def.json
+          jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)' \
+            task-def.json > task-def-clean.json
+
+      - name: Update task definition image
+        run: |
+          jq --arg img "${{ steps.image.outputs.uri }}" \
+            '.containerDefinitions[0].image = $img' task-def-clean.json > new-task-def.json
+
+      - name: Register task definition
+        id: task
+        run: |
+          ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://new-task-def.json \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+          echo "arn=$ARN" >> "$GITHUB_OUTPUT"
+
+      - name: Update ECS service
+        run: |
+          aws ecs update-service \
+            --cluster "${{ env.ECS_CLUSTER }}" \
+            --service "${{ env.ECS_SERVICE }}" \
+            --task-definition "${{ steps.task.outputs.arn }}" \
+            --force-new-deployment
+
+      - name: Wait for service stability
+        run: |
+          aws ecs wait services-stable \
+            --cluster "${{ env.ECS_CLUSTER }}" \
+            --services "${{ env.ECS_SERVICE }}"
